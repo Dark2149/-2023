@@ -1,0 +1,162 @@
+import ips
+from forecast import wind_speed, sun_power, houseA_con, houseB_con, hosp_con, fact_con
+
+
+def normalize(x):
+    s = 1
+    return 2 ** (x - s) + 1 - 2 ** -s
+
+
+def adopt_wind(x, el):
+    a, b = 0.5, 0.5
+    return a * x + b * windmils[el][0]
+
+
+def adopt_sun(x, el):
+    a, b = 0.5, 0.5
+    return a * x + b * panels[el][0]
+
+
+def mining(type, contract):
+    if type == 'houseA':
+        return 0.82 * ((5 - contract) ** 2.6) if contract < 5 else 0
+    elif type == 'houseB':
+        return 0.24 * ((9 - contract) ** 2.2) if contract < 9 else 0
+    return 0
+
+
+psm = ips.init()
+tick = psm.tick
+
+lost = 0
+storaged = {}
+windmils = {}
+panels = {}
+min_charge = 90
+sell_price = 5
+buy_price = 2
+real_con = 0
+gen_pred = 0
+con_pred = 0
+gen_pred_plus = 0
+con_pred_plus = 0
+
+print(f'--------- {tick} тик ---------')
+# управление энергорайонами
+for index, net in psm.networks.items():
+    if len(net.location) == 0: continue
+    addr = net.location[-1][0]
+    for obj in psm.objects:
+        if obj.id == (addr[0], addr[1]):
+            id_station = list(obj)[3][0]
+    line = net.location[-1][1]
+    wear = round(net.wear*100, 2)
+    print(f'Износ {line} линии на подстанции {id_station}: {wear} %  {"ON" if net.online else "OFF"}')
+    lost += net.losses
+    if not net.online:
+        psm.orders.line_on(id_station, line)
+    if net.wear > 0.7:
+        psm.orders.line_off(id_station, line)
+
+# сбор инфы по накопителям, ветрякам и панелям
+for obj in psm.objects:
+    if obj.type == "storage":
+        storaged[obj.address[0]] = obj.charge.now
+    if obj.type == "wind":
+        windmils[obj.address[0]] = [obj.power.now.generated, obj.power.now.online]
+    if obj.type == 'solar':
+        panels[obj.address[0]] = [obj.power.now.generated, obj.power.now.online]
+
+# прогноз на производство энергии
+if tick < 98:
+    wind = wind_speed[tick + 1] - wind_speed[tick]
+    wind_plus = wind_speed[tick + 2] - wind_speed[tick + 1]
+    sun = sun_power[tick + 1] - sun_power[tick]
+    sun_plus = sun_power[tick + 2] - sun_power[tick + 1]
+elif tick < 99:
+    wind = wind_speed[tick + 1] - wind_speed[tick]
+    wind_plus = wind_speed[tick + 1]
+    sun = sun_power[tick + 1] - sun_power[tick]
+    sun_plus = sun_power[tick + 1]
+else:
+    wind = wind_speed[tick]
+    wind_plus = wind_speed[tick]
+    sun = sun_power[tick]
+    sun_plus = sun_power[tick]
+for el in windmils:
+    gen_pred += int(windmils[el][1]) * adopt_wind(min(25, windmils[el][0] * normalize(wind)), el)
+    gen_pred_plus += adopt_wind(min(25, gen_pred * normalize(wind_plus)), el)
+for el in panels:
+    gen_pred += int(panels[el][1]) * adopt_sun(min(25, panels[el][0] * normalize(sun)), el)
+    gen_pred_plus += adopt_sun(min(25, panels[el][0] * normalize(sun)), el)
+
+# прогноз на потребление энергии
+buildings = {'houseA': houseA_con, 'houseB': houseB_con, 
+            'hospital': hosp_con, 'factory': fact_con}
+corridors = {'houseA': 0.3, 'houseB': 0.3, 
+            'hospital': 0.25, 'factory': 0.5}
+for obj in psm.objects:
+    if obj.type in buildings:
+        real_con += obj.power.now.consumed
+        try:
+            con_pred += buildings[obj.type][tick + 1]
+        except:
+            con_pred += buildings[obj.type][tick]
+        con_pred += mining(obj.type, obj.contract) + corridors[obj.type]
+        try:
+            con_pred_plus += buildings[obj.type][tick + 2] 
+        except:
+            try:
+                con_pred_plus += buildings[obj.type][tick + 1]
+            except:
+                con_pred_plus += buildings[obj.type][tick]
+        con_pred_plus += mining(obj.type, obj.contract) + corridors[obj.type]
+
+# вывод
+with open('gen_and_con.txt', mode='r+') as f:
+        lines = f.read().split('\n')
+        gen_pred_old = lines[-2]
+        con_pred_old = lines[-1]
+        f.write(f'\n{gen_pred}\n{con_pred}')
+print('Выроботка за текущий тик: ', psm.total_power.generated)
+print('Прогноз на выроботку: ', gen_pred_old)
+print('Потребление за текущий тик: ', real_con)
+print('Прогноз на потребление: ', con_pred_old)
+print('Потери: ', lost)
+print('В накопителях ', sum(storaged.values()))
+
+# зарядка/разрядка аккумуляторов и продажа/покупка на бирже
+delta = gen_pred - con_pred - lost
+delta_plus = gen_pred_plus - con_pred_plus - lost
+if delta > 0:# есть излишки энергии
+    for storage in storaged.keys():
+        if delta > 0 and sum(storaged.values()) < min_charge: 
+            c = min(100 - storaged[storage], delta, 15)
+            psm.orders.charge(storage, c)
+            print(f'Зарядка {storage} на {c}')
+            delta -= c
+            storaged[storage] += c
+        else:
+            break
+if delta > 1:
+    print(f'Заявка на продажу {delta - 1} МВт')
+    psm.orders.sell(delta - 1, sell_price)
+elif delta < 0: #нехватка энергии
+    for storage in storaged.keys():
+        if delta < 0 and sum(storaged.values()) > 0:
+            c = min(storaged[storage], -delta, 15)
+            psm.orders.discharge(storage, c)
+            print(f'Разрядка {storage} на {c}')
+            delta += c
+            storaged[storage] -= c
+        else:
+            break
+try:
+    if delta_plus < 0:
+        if sum(storaged.values()) + delta_plus < 0:
+            print(f'Заявка на покупку {abs(delta_plus)} МВт, энергия будет на {tick + 1} тике')
+            psm.orders.buy(abs(delta_plus), buy_price)
+except:
+    pass
+
+psm.save_and_exit()
